@@ -100,26 +100,31 @@ class RateModel:
             prediction[test_idx] = booster.predict(frame.iloc[test_idx][FEATURES])
         return target - prediction
 
-    # ---------------------------------------------------------------------- fit
-    def fit(self, frame: pd.DataFrame) -> "RateModel":
-        frame = frame.reset_index(drop=True)
-        stage1 = lane_screen(frame)
+    def screen_and_drift(self, frame: pd.DataFrame, stage1: np.ndarray | None = None):
+        """Screen the labels and measure the drift; returns the rows worth fitting on.
+
+        Cross-fitted residuals do double duty here: their day-level mean is the drift,
+        and their spread exposes the corrupted labels that the lane screen missed
+        (those sitting on lanes too thin for a median to mean anything).
+        """
+        stage1 = lane_screen(frame) if stage1 is None else stage1
         screened = frame.loc[stage1].reset_index(drop=True)
 
-        # Cross-fitted residuals: used both to measure the drift and to find the
-        # corrupted labels that survived the lane screen.
         residual = self._out_of_fold(screened, self._target(screened))
         self.drift = fit_drift(screened["date"], residual, self.epoch)
 
         detrended = residual - self._drift_offset(screened["t"])
-        sigma = robust_sigma(detrended)
-        stage2 = np.abs(detrended - np.median(detrended)) < RESIDUAL_MAD_K * sigma
-        self.log_sigma = sigma
+        self.log_sigma = robust_sigma(detrended)
+        stage2 = np.abs(detrended - np.median(detrended)) < RESIDUAL_MAD_K * self.log_sigma
 
-        final = screened.loc[stage2]
         self.kept = np.zeros(len(frame), bool)
         self.kept[np.flatnonzero(stage1)[stage2]] = True
+        return screened.loc[stage2]
 
+    # ---------------------------------------------------------------------- fit
+    def fit(self, frame: pd.DataFrame) -> "RateModel":
+        frame = frame.reset_index(drop=True)
+        final = self.screen_and_drift(frame)
         target = self._target(final) - self._drift_offset(final["t"])
         self.booster = self._new_booster().fit(final[FEATURES], target)
         return self
